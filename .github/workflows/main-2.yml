@@ -46,7 +46,6 @@ jobs:
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # 创建本地用户并添加到管理员和远程桌面组
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
@@ -73,38 +72,36 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_USER_ID: ${{ secrets.FEISHU_USER_ID }}
         run: |
-          # 检查 TAILSCALE_AUTH_KEY 是否存在
           if (-not $env:TAILSCALE_AUTH_KEY -or $env:TAILSCALE_AUTH_KEY.Trim() -eq "") {
             Write-Host "❌ 未配置 TAILSCALE_AUTH_KEY，无法自动登录 Tailscale！"
             exit 1
           }
 
-          # 启动 Tailscale
           Write-Host "⚙️ 正在启动 Tailscale..."
           $output = & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID 2>&1
           Write-Host $output
 
-          # 检测是否需要手动授权
           if ($output -match "https://login.tailscale.com/a/[A-Za-z0-9-]+") {
             $authUrl = $matches[0]
             Write-Host "⚠️ Tailscale 需要手动登录授权: $authUrl"
 
             try {
-              # 获取飞书 tenant access token
               $tokenBody = @{ app_id = $env:FEISHU_APP_ID; app_secret = $env:FEISHU_APP_SECRET } | ConvertTo-Json
               $tokenResp = Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal/" -Method POST -Body $tokenBody -ContentType "application/json"
               $tenantToken = $tokenResp.tenant_access_token
 
-              # 推送消息到指定用户
-              $msg = "⚠️ Tailscale 需要在浏览器手动授权：`n$authUrl`"
+              $contentJson = @{ text = "⚠️ Tailscale 需要在浏览器手动授权：`n$authUrl" } | ConvertTo-Json -Depth 1
               $payload = @{
-                receive_id_type = "user_id"
-                receive_id = $env:FEISHU_USER_ID
-                content = (@{ text = $msg } | ConvertTo-Json)
-                msg_type = "text"
-              } | ConvertTo-Json
+                  receive_id_type = "user_id"
+                  receive_id      = $env:FEISHU_USER_ID
+                  content         = $contentJson
+                  msg_type        = "text"
+              } | ConvertTo-Json -Depth 3
 
-              Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=user_id" -Headers @{ Authorization = "Bearer $tenantToken" } -Method POST -Body $payload -ContentType "application/json"
+              Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=user_id" `
+                -Headers @{ Authorization = "Bearer $tenantToken" } `
+                -Method POST -Body $payload -ContentType "application/json"
+
               Write-Host "📨 飞书通知已发送，请在浏览器完成 Tailscale 授权。"
             } catch {
               Write-Host "❌ 飞书通知发送失败: $($_.Exception.Message)"
@@ -125,22 +122,23 @@ jobs:
       - name: 📤 飞书发送 RDP 登录信息
         shell: pwsh
         run: |
-          # 获取 tenant access token
+          $rdpMsg = "✅ Windows RDP 已启动：`nIP: $env:TAILSCALE_IP`n用户名: RDP`n密码: $env:RDP_PASSWORD"
+
+          $contentJson = @{ text = $rdpMsg } | ConvertTo-Json -Depth 1
+          $payload = @{
+              receive_id_type = "user_id"
+              receive_id      = $env:FEISHU_USER_ID
+              content         = $contentJson
+              msg_type        = "text"
+          } | ConvertTo-Json -Depth 3
+
           $tokenBody = @{ app_id = $env:FEISHU_APP_ID; app_secret = $env:FEISHU_APP_SECRET } | ConvertTo-Json
           $tokenResp = Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal/" -Method POST -Body $tokenBody -ContentType "application/json"
           $tenantToken = $tokenResp.tenant_access_token
 
-          $rdpMsg = "✅ Windows RDP 已启动：`nIP: $env:TAILSCALE_IP`n用户名: RDP`n密码: $env:RDP_PASSWORD"
-          $msgBody = @{
-            receive_id_type = "user_id"
-            receive_id = $env:FEISHU_USER_ID
-            content = (@{ text = $rdpMsg } | ConvertTo-Json)
-            msg_type = "text"
-          } | ConvertTo-Json
-
           Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=user_id" `
             -Headers @{ Authorization = "Bearer $tenantToken" } `
-            -Method POST -Body $msgBody -ContentType "application/json"
+            -Method POST -Body $payload -ContentType "application/json"
           Write-Host "📨 RDP 登录信息已通过飞书发送。"
 
       - name: ⏳ 保持会话活跃
