@@ -1,36 +1,59 @@
 name: RDP with Tailscale & Feishu Notify
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 */5 * * *" # 每 5 小时自动运行一次
+    - cron: "0 */5 * * *" # 每 5 小时运行一次（UTC）
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
 
+    # ---------- 注意：不要在这里放 secrets 明文。全部通过仓库 Secrets 注入 ----------
+    env:
+      FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+      FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+      FEISHU_USER_ID: ${{ secrets.FEISHU_USER_ID }}
+      # TAILSCALE_AUTH_KEY 单独在对应步骤通过 env 注入（见下方），但也可放在这里：
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
     steps:
-      - name: 🧩 Configure RDP
+      - name: Checkout (no code required but keeps logs一致)
+        uses: actions/checkout@v4
+
+      - name: Configure Core RDP Settings
+        shell: pwsh
         run: |
-          # 启用远程桌面，并关闭 NLA 验证层
+          Write-Host "=== Configure Core RDP Settings ==="
+
+          # 启用远程桌面（允许连接）
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # 关闭 NLA（如需更安全请改回 1）
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "UserAuthentication" -Value 0 -Force
+
+          # 使用原始 RDP 安全层（0），如需 TLS/NLA 安全请设置为合适值
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "SecurityLayer" -Value 0 -Force
 
-          # 删除旧规则并重新开放 3389 端口
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          # 删除可能存在的旧防火墙规则并添加新规则
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing RDP-Tailscale rule"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-          # 重启远程桌面服务
+          # 重启远程桌面服务以确保生效
           Restart-Service -Name TermService -Force
+          Write-Host "RDP configured."
 
-      - name: 👤 Create RDP User
+      - name: Create RDP User with Secure Password
+        shell: pwsh
         run: |
+          Write-Host "=== Create RDP User with Secure Password ==="
           Add-Type -AssemblyName System.Security
+
+          # 生成高强度密码（4 大写 + 4 小写 + 4 数字 + 4 特殊字符 -> 打乱）
           $charSet = @{
               Upper   = [char[]](65..90)
               Lower   = [char[]](97..122)
@@ -43,88 +66,185 @@ jobs:
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          # 如果已存在则重设密码，否则新建用户
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Write-Host "User RDP exists — resetting password"
+              Set-LocalUser -Name "RDP" -Password $securePass
+          } else {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
 
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          # 将密码导出为环境变量供后续步骤使用（注意：GitHub 运行日志会显示 echo 的内容，务必控制仓库访问）
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      - name: 🌐 Install Tailscale
+          Write-Host "RDP user created/updated."
+
+      - name: Install Tailscale
+        shell: pwsh
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          Write-Host "=== Install Tailscale ==="
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed."
 
-      - name: 🔐 Start Tailscale & Detect Auth
+      - name: Start Tailscale & Detect Auth (robust)
         id: tailscale
         shell: pwsh
+        env:
+          # 必须用 env 显式注入 secrets，避免空值情况
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_USER_ID: ${{ secrets.FEISHU_USER_ID }}
         run: |
-          $output = & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID 2>&1
-          Write-Host $output
+          Write-Host "=== Start Tailscale & Detect Auth ==="
 
-          if ($output -match "https://login.tailscale.com/a/[a-z0-9]+") {
-            $authUrl = $matches[0]
-            Write-Host "⚠️ 需要人工登录授权: $authUrl"
-
-            # 获取飞书 tenant access token
-            $tokenBody = @{
-              app_id     = "${{ secrets.FEISHU_APP_ID }}"
-              app_secret = "${{ secrets.FEISHU_APP_SECRET }}"
-            } | ConvertTo-Json
-            $tokenResp = Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal/" -Method POST -Body $tokenBody -ContentType "application/json"
-            $tenantToken = $tokenResp.tenant_access_token
-
-            # 向指定用户推送提醒
-            $msgBody = @{
-              receive_id = "${{ secrets.FEISHU_USER_ID }}"
-              content    = (@{ text = "⚠️ Tailscale 需要人工授权登录：`n$authUrl" } | ConvertTo-Json)
-              msg_type   = "text"
-            } | ConvertTo-Json
-            Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=user_id" -Headers @{ Authorization = "Bearer $tenantToken" } -Method POST -Body $msgBody -ContentType "application/json"
-
+          # 1) 检查 secret 是否存在并非空
+          if (-not $env:TAILSCALE_AUTH_KEY -or $env:TAILSCALE_AUTH_KEY.Trim() -eq "") {
+            Write-Host "❌ TAILSCALE_AUTH_KEY is missing or empty. Aborting to avoid interactive login."
+            # 尝试通知飞书（若配置了 Feishu）
+            try {
+              if ($env:FEISHU_APP_ID -and $env:FEISHU_APP_SECRET -and $env:FEISHU_USER_ID) {
+                $tokenBody = @{ app_id = $env:FEISHU_APP_ID; app_secret = $env:FEISHU_APP_SECRET } | ConvertTo-Json
+                $tokenResp = Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal/" -Method POST -Body $tokenBody -ContentType "application/json"
+                $tenantToken = $tokenResp.tenant_access_token
+                $msg = "❌ CI: TAILSCALE_AUTH_KEY 未配置或为空，无法自动认证 Tailscale。请在仓库 Secrets 中添加 TAILSCALE_AUTH_KEY（建议为 Reusable）。"
+                $payload = @{
+                  receive_id_type = "user_id"
+                  receive_id = $env:FEISHU_USER_ID
+                  content = (@{ text = $msg } | ConvertTo-Json)
+                  msg_type = "text"
+                } | ConvertTo-Json
+                Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=user_id" -Headers @{ Authorization = "Bearer $tenantToken" } -Method POST -Body $payload -ContentType "application/json"
+              } else {
+                Write-Host "Feishu secrets not fully configured; skipping Feishu warning."
+              }
+            } catch {
+              Write-Host "Failed to send Feishu warning: $($_.Exception.Message)"
+            }
             exit 1
           }
 
-          Write-Host "✅ Tailscale authenticated successfully."
+          # 2) 运行 tailscale up 并捕获输出（捕获 stderr）
+          $exe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path $exe)) {
+            Write-Host "❌ tailscale.exe not found at $exe"
+            exit 1
+          }
+          Write-Host "Running tailscale up..."
+          $output = & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID 2>&1
+          Write-Host $output
 
-      - name: 🧭 Get Tailscale IP
+          # 3) 若输出包含手动登录链接，则通知飞书并退出
+          if ($output -match "https://login.tailscale.com/a/[A-Za-z0-9-]+") {
+            $authUrl = $matches[0]
+            Write-Host "⚠️ Tailscale requires manual authentication: $authUrl"
+
+            try {
+              if ($env:FEISHU_APP_ID -and $env:FEISHU_APP_SECRET -and $env:FEISHU_USER_ID) {
+                $tokenBody = @{ app_id = $env:FEISHU_APP_ID; app_secret = $env:FEISHU_APP_SECRET } | ConvertTo-Json
+                $tokenResp = Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal/" -Method POST -Body $tokenBody -ContentType "application/json"
+                $tenantToken = $tokenResp.tenant_access_token
+
+                $msg = "⚠️ Tailscale 需要在浏览器手动授权：`n$authUrl`n请在 5 分钟内完成授权。"
+                $payload = @{
+                  receive_id_type = "user_id"
+                  receive_id = $env:FEISHU_USER_ID
+                  content = (@{ text = $msg } | ConvertTo-Json)
+                  msg_type = "text"
+                } | ConvertTo-Json
+
+                Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=user_id" `
+                  -Headers @{ Authorization = "Bearer $tenantToken" } `
+                  -Method POST -Body $payload -ContentType "application/json"
+
+                Write-Host "Feishu notification sent about manual Tailscale auth."
+              } else {
+                Write-Host "Feishu not configured; cannot send manual auth notification."
+              }
+            } catch {
+              Write-Host "Failed to notify Feishu: $($_.Exception.Message)"
+            }
+
+            # 退出以避免继续执行并浪费 runner
+            exit 1
+          }
+
+          Write-Host "✅ Tailscale authenticated (no manual auth required)."
+
+      - name: Get Tailscale IP
         shell: pwsh
         run: |
-          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "=== Get Tailscale IP ==="
+          $exe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          $tsIP = & $exe ip -4
+          if (-not $tsIP) {
+            Write-Host "❌ Failed to get Tailscale IP"
+            exit 1
+          }
           Write-Host "Tailscale IP: $tsIP"
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: 📤 Send RDP Info to Feishu
+      - name: Verify RDP Accessibility
         shell: pwsh
         run: |
-          # 获取 Tenant Access Token
-          $tokenBody = @{
-            app_id     = "${{ secrets.FEISHU_APP_ID }}"
-            app_secret = "${{ secrets.FEISHU_APP_SECRET }}"
-          } | ConvertTo-Json
-          $tokenResp = Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal/" -Method POST -Body $tokenBody -ContentType "application/json"
-          $tenantToken = $tokenResp.tenant_access_token
+          Write-Host "=== Verify RDP Accessibility ==="
+          if (-not $env:TAILSCALE_IP) {
+            Write-Error "TAILSCALE_IP not set"
+            exit 1
+          }
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "TCP connection to RDP port 3389 failed"
+            exit 1
+          }
+          Write-Host "TCP connectivity to 3389 OK."
 
-          $rdpMsg = "✅ Windows RDP 已启动：`nIP: $env:TAILSCALE_IP`nUser: RDP`nPassword: $env:RDP_PASSWORD"
-          $msgBody = @{
-            receive_id = "${{ secrets.FEISHU_USER_ID }}"
-            content    = (@{ text = $rdpMsg } | ConvertTo-Json)
-            msg_type   = "text"
-          } | ConvertTo-Json
-
-          Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=user_id" `
-            -Headers @{ Authorization = "Bearer $tenantToken" } `
-            -Method POST -Body $msgBody -ContentType "application/json"
-
-      - name: ⏳ Keep Session Alive
+      - name: Send RDP Info to Feishu
+        shell: pwsh
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_USER_ID: ${{ secrets.FEISHU_USER_ID }}
         run: |
+          Write-Host "=== Send RDP Info to Feishu ==="
+          try {
+            $tokenBody = @{ app_id = $env:FEISHU_APP_ID; app_secret = $env:FEISHU_APP_SECRET } | ConvertTo-Json
+            $tokenResp = Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal/" -Method POST -Body $tokenBody -ContentType "application/json"
+            $tenantToken = $tokenResp.tenant_access_token
+
+            $rdpMsg = "✅ RDP 已启动`n📡 IP: $env:TAILSCALE_IP`n👤 User: $env:RDP_USER`n🔑 Password: $env:RDP_PASSWORD"
+            $payload = @{
+              receive_id_type = "user_id"
+              receive_id = $env:FEISHU_USER_ID
+              content = (@{ text = $rdpMsg } | ConvertTo-Json)
+              msg_type = "text"
+            } | ConvertTo-Json
+
+            Invoke-RestMethod -Uri "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=user_id" `
+              -Headers @{ Authorization = "Bearer $tenantToken" } `
+              -Method POST -Body $payload -ContentType "application/json"
+
+            Write-Host "Feishu message sent."
+          } catch {
+            Write-Host "Failed to send Feishu message: $($_.Exception.Message)"
+          }
+
+      - name: Keep Session Alive (manual termination)
+        shell: pwsh
+        run: |
+          Write-Host "=== Keep Session Alive (will log heartbeat every 5 minutes). ==="
           while ($true) {
-            Write-Host "[$(Get-Date)] ✅ RDP Active - Press Ctrl+C to stop."
+            Write-Host "[$(Get-Date -Format o)] RDP Active - Press Ctrl+C in workflow to stop."
             Start-Sleep -Seconds 300
           }
