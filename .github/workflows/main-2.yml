@@ -2,8 +2,8 @@ name: 🖥️ RDP + Tailscale + 飞书通知
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */5 * * *" # 每 5 小时自动运行一次
+#  schedule:
+#    - cron: "0 */5 * * *" # 每 5 小时自动运行一次
 
 jobs:
   secure-rdp:
